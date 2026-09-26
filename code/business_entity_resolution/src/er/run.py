@@ -1,0 +1,260 @@
+"""End-to-end pipeline: learn on the training data, then predict the test set.
+
+Commands
+  train    normalise train data -> blocking -> features -> LightGBM -> tune threshold
+           on held-out Source-1 entities (reports the challenge metric)
+  predict  normalise test data -> blocking -> features -> predict -> decide ->
+           write output/matching_results.tsv and output/candidate_pairs.tsv ->
+           run the official validator
+
+Examples (from the repository root):
+  scripts/py -m er.run train   --train-dir ../../dataset/train --work work/full
+  scripts/py -m er.run predict --test-dir  ../../dataset/test  --work work/full --out-dir output
+
+Source-1 entities of the training data are split by a hash of their id:
+  5% early stopping, 15% evaluation, ``--train-pct`` % training, rest unused.
+Every Source-2/3 record always stays in the candidate pool, so evaluated
+entities face exactly the competition they would face in the test set.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import zlib
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+from .blocking import generate_candidates, load_prep, recall_report, true_pair_mask
+from .evaluate import score_positions, sweep_thresholds
+from .features import FEATURES, FeatureBuilder, iter_query_chunks
+from .io import check_clean_ids, read_ground_truth, read_source
+from .model import best_per_query, train_model
+from .prepare import normalize_frame
+
+UNUSED, TRAIN, ES, VAL = 0, 1, 2, 3
+T0 = time.time()
+
+
+def log(msg):
+    print(f"[{time.time() - T0:6.0f}s] {msg}", flush=True)
+
+
+def ensure_prep(src_dir, prefix, prep_dir, workers=None):
+    """Normalise the three source files once; later runs reuse the parquet cache."""
+    os.makedirs(prep_dir, exist_ok=True)
+    for s in (1, 2, 3):
+        out = os.path.join(prep_dir, f"s{s}.parquet")
+        if os.path.exists(out):
+            continue
+        df = normalize_frame(read_source(os.path.join(src_dir, f"{prefix}_source{s}.tsv")), workers)
+        df["src"] = s
+        df.to_parquet(out, index=False)
+        log(f"normalised {prefix} source {s}: {len(df)} rows")
+    return prep_dir
+
+
+def s1_folds(s1_ids, train_pct):
+    """Fold of every Source-1 entity from a (salted) hash of its id.
+
+    The salt keeps folds independent of the unsalted hash used by er.sample.
+    """
+    h = np.fromiter((zlib.crc32(b"fold:" + x.encode()) % 100 for x in s1_ids), dtype=np.int16, count=len(s1_ids))
+    fold = np.full(len(h), UNUSED, dtype=np.int8)
+    fold[h < 5] = ES
+    fold[(h >= 5) & (h < 20)] = VAL
+    fold[(h >= 20) & (h < 20 + train_pct)] = TRAIN
+    return fold
+
+
+def compute_features(cands, fb, path, chunk_pairs):
+    """Features for all candidate pairs, written to a float32 .npy memmap."""
+    x = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=(len(cands), len(FEATURES)))
+    done = 0
+    for sl in iter_query_chunks(cands, chunk_pairs):
+        x[sl] = fb.transform(cands.iloc[sl]).to_numpy(dtype=np.float32)
+        done = sl.stop
+        log(f"  features {done}/{len(cands)}")
+    x.flush()
+    return x
+
+
+def predict_chunks(model, x, chunk_pairs):
+    p = np.empty(x.shape[0], dtype=np.float32)
+    for start in range(0, x.shape[0], chunk_pairs):
+        p[start:start + chunk_pairs] = model.predict(x[start:start + chunk_pairs], num_threads=0)
+    return p
+
+
+# --------------------------------------------------------------------------
+# train
+# --------------------------------------------------------------------------
+
+def cmd_train(args):
+    os.makedirs(args.work, exist_ok=True)
+    prep = ensure_prep(args.train_dir, "train", os.path.join(args.work, "prep_train"), args.workers)
+    s1, q = load_prep(prep)
+    truth = read_ground_truth(os.path.join(args.train_dir, "train_ground_truth.tsv"))
+    log(f"loaded train: {len(s1)} S1, {len(q)} S2/S3, {sum(len(v) for v in truth.values())} true pairs")
+
+    cands = generate_candidates(s1, q, args.k, args.max_df_frac)
+    hit = true_pair_mask(cands, s1, q, truth)
+    recall = recall_report(cands, hit, sum(len(v) for v in truth.values()))
+    log(f"blocking: {len(cands)} pairs; " + ", ".join(recall))
+
+    fold = s1_folds(s1["entity_id"].to_numpy(), args.train_pct)
+    pair_fold = fold[cands["s1_pos"].to_numpy()]
+    fb = FeatureBuilder(s1, q)
+    x = compute_features(cands, fb, os.path.join(args.work, "train_features.npy"), args.chunk_pairs)
+    del fb
+
+    tr, es = pair_fold == TRAIN, pair_fold == ES
+    log(f"training on {tr.sum()} pairs ({hit[tr].sum()} positive), early-stopping on {es.sum()}")
+    model = train_model(x[tr], hit[tr].astype(np.int8), x[es], hit[es].astype(np.int8))
+    log(f"model: {model.best_iteration} rounds")
+    p = predict_chunks(model, x, args.chunk_pairs)
+
+    # decision + threshold on the evaluation fold
+    s1_pos_of = pd.Series(np.arange(len(s1)), index=s1["entity_id"].to_numpy())
+    q_owner = {x_: s for s, ids in truth.items() for x_ in ids}
+    owner_pos = pd.Series(q["entity_id"].to_numpy()).map(q_owner).map(s1_pos_of).fillna(-1).to_numpy(np.int64)
+    n_true = np.array([len(truth.get(e, ())) for e in s1["entity_id"]], dtype=np.int64)
+    best = best_per_query(cands["q_pos"].to_numpy(), cands["s1_pos"].to_numpy(), p)
+    correct = best["s1_pos"].to_numpy() == owner_pos[best["q_pos"].to_numpy()]
+    val_mask = fold == VAL
+    grid = np.round(np.arange(0.05, 0.96, 0.01), 2)
+    scores = sweep_thresholds(best, correct, n_true, val_mask, grid)
+    t_best = float(grid[int(np.argmax(scores))])
+    keep = best["p"].to_numpy() >= t_best
+    chosen_s1, chosen_ok = best["s1_pos"].to_numpy()[keep], correct[keep]
+
+    meta = {
+        "threshold": t_best, "k": args.k, "max_df_frac": args.max_df_frac, "train_pct": args.train_pct,
+        "rounds": model.best_iteration, "features": FEATURES, "blocking_recall": recall,
+        "val_f05": max(scores),
+        "val_f05_by_threshold": {f"{t:.2f}": round(s, 5) for t, s in zip(grid, scores) if round(t * 100) % 5 == 0},
+        "val_ceiling_after_blocking": score_positions(cands["s1_pos"].to_numpy()[hit], np.ones(hit.sum(), bool),
+                                                      n_true, val_mask),
+        "val_predict_nothing": score_positions(np.array([], dtype=np.int64), np.array([], dtype=bool),
+                                               n_true, val_mask),
+    }
+    country = s1["country"].to_numpy()
+    for c in sorted(set(country)):
+        meta[f"val_f05_{c}"] = score_positions(chosen_s1, chosen_ok, n_true, val_mask & (country == c))
+    imp = pd.Series(model.feature_importance("gain"), index=FEATURES)
+    meta["feature_gain_pct"] = {k: round(v, 2) for k, v in (imp / imp.sum() * 100).sort_values(ascending=False).items()}
+    model.save_model(os.path.join(args.work, "model.txt"))
+    with open(os.path.join(args.work, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+
+    # evaluation-fold pairs for error analysis
+    vm = pair_fold == VAL
+    pd.DataFrame({
+        "q_id": q["entity_id"].to_numpy()[cands["q_pos"].to_numpy()[vm]],
+        "s1_id": s1["entity_id"].to_numpy()[cands["s1_pos"].to_numpy()[vm]],
+        "blk_rank": cands["blk_rank"].to_numpy()[vm], "p": p[vm], "y": hit[vm],
+    }).to_parquet(os.path.join(args.work, "val_pairs.parquet"), index=False)
+
+    summary = {k: meta[k] for k in meta if k.startswith("val_f05") and k != "val_f05_by_threshold"}
+    summary.update(threshold=t_best, rounds=meta["rounds"], ceiling=round(meta["val_ceiling_after_blocking"], 5))
+    log("TRAIN SUMMARY " + json.dumps({k: (round(v, 5) if isinstance(v, float) else v) for k, v in summary.items()}))
+    log("top features: " + ", ".join(f"{k}={v}%" for k, v in list(meta["feature_gain_pct"].items())[:8]))
+
+
+# --------------------------------------------------------------------------
+# predict
+# --------------------------------------------------------------------------
+
+def write_grouped(path, header, s1_ids, s1_pos, q_ids, sort_key=None):
+    """One row per Source-1 id listing the ids of its pairs (all S1 rows written)."""
+    s1_pos = np.asarray(s1_pos)
+    order = np.lexsort((sort_key, s1_pos)) if sort_key is not None else np.argsort(s1_pos, kind="stable")
+    sp, qs = s1_pos[order], np.asarray(q_ids)[order]
+    bounds = np.searchsorted(sp, np.arange(len(s1_ids) + 1))
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(header + "\n")
+        for i, sid in enumerate(s1_ids):
+            f.write(sid + "\t" + ",".join(qs[bounds[i]:bounds[i + 1]]) + "\n")
+    check_clean_ids(path)
+
+
+def cmd_predict(args):
+    with open(os.path.join(args.work, "meta.json")) as f:
+        meta = json.load(f)
+    model = lgb.Booster(model_file=os.path.join(args.work, "model.txt"))
+    prep = ensure_prep(args.test_dir, "test", os.path.join(args.work, "prep_test"), args.workers)
+    s1, q = load_prep(prep)
+    log(f"loaded test: {len(s1)} S1, {len(q)} S2/S3; threshold {meta['threshold']}")
+
+    cands = generate_candidates(s1, q, meta["k"], meta["max_df_frac"])
+    log(f"blocking: {len(cands)} pairs")
+    fb = FeatureBuilder(s1, q)
+    p = np.empty(len(cands), dtype=np.float32)
+    for sl in iter_query_chunks(cands, args.chunk_pairs):
+        p[sl] = model.predict(fb.transform(cands.iloc[sl]).to_numpy(dtype=np.float32), num_threads=0)
+        log(f"  scored {sl.stop}/{len(cands)}")
+    del fb
+
+    best = best_per_query(cands["q_pos"].to_numpy(), cands["s1_pos"].to_numpy(), p)
+    chosen = best[best["p"] >= meta["threshold"]]
+    s1_ids = s1["entity_id"].to_numpy()
+    q_ids = q["entity_id"].to_numpy()
+    m_path = os.path.join(args.out_dir, "matching_results.tsv")
+    c_path = os.path.join(args.out_dir, "candidate_pairs.tsv")
+    write_grouped(m_path, "source1_entity_id\tmatched_entity_ids", s1_ids,
+                  chosen["s1_pos"].to_numpy(), q_ids[chosen["q_pos"].to_numpy()], -chosen["p"].to_numpy())
+    write_grouped(c_path, "source1_entity_id\tcandidate_entity_ids", s1_ids,
+                  cands["s1_pos"].to_numpy(), q_ids[cands["q_pos"].to_numpy()])
+    log(f"wrote {m_path} and {c_path}")
+
+    # sanity summary: compare with the training distribution (5.6% singletons, ~3.5 matches/entity)
+    n_per_s1 = np.bincount(chosen["s1_pos"].to_numpy(), minlength=len(s1))
+    country = s1["country"].to_numpy()
+    stats = {"pairs_matched": int(len(chosen)), "queries": int(len(q)),
+             "s1_empty_pct": round(float((n_per_s1 == 0).mean() * 100), 2),
+             "avg_matches_per_s1": round(float(n_per_s1.mean()), 3)}
+    for c in sorted(set(country)):
+        m = country == c
+        stats[f"{c}_empty_pct"] = round(float((n_per_s1[m] == 0).mean() * 100), 2)
+        stats[f"{c}_avg_matches"] = round(float(n_per_s1[m].mean()), 3)
+    with open(os.path.join(args.work, "predict_stats.json"), "w") as f:
+        json.dump(stats, f, indent=1)
+    log("PREDICT SUMMARY " + json.dumps(stats))
+
+    if args.validator and os.path.exists(args.validator):
+        cmd = [sys.executable, args.validator, "--matching", m_path, "--candidate", c_path,
+               "--test-dir", args.test_dir, "--check-ids"]
+        log("running validator: " + " ".join(cmd))
+        subprocess.run(cmd, check=False)
+    else:
+        log(f"validator not found at {args.validator}; skipped")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("train", "predict"):
+        p = sub.add_parser(name)
+        p.add_argument("--work", default="work/full", help="cache/model folder")
+        p.add_argument("--chunk-pairs", type=int, default=2_000_000)
+        p.add_argument("--workers", type=int, default=None, help="processes for normalisation")
+    tp = sub.choices["train"]
+    tp.add_argument("--train-dir", default="../../dataset/train")
+    tp.add_argument("--k", type=int, default=10, help="candidates per query")
+    tp.add_argument("--max-df-frac", type=float, default=0.002)
+    tp.add_argument("--train-pct", type=int, default=40, help="%% of Source-1 entities used for training")
+    pp = sub.choices["predict"]
+    pp.add_argument("--test-dir", default="../../dataset/test")
+    pp.add_argument("--out-dir", default="output")
+    pp.add_argument("--validator", default="../../utils/validate_submission.py")
+    args = ap.parse_args()
+    {"train": cmd_train, "predict": cmd_predict}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

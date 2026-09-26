@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run the project's Python interpreter.
+# On macOS, LightGBM needs OpenMP (libomp); we point it at the copy that
+# scikit-learn already bundles, so no Homebrew install is required.
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [[ -f "$HERE/.venv/bin/python" ]]; then
+  PY="$HERE/.venv/bin/python"
+elif [[ -f "$HERE/../../.venv/bin/python" ]]; then
+  PY="$HERE/../../.venv/bin/python"
+elif [[ -n "${VIRTUAL_ENV:-}" && -f "$VIRTUAL_ENV/bin/python" ]]; then
+  PY="$VIRTUAL_ENV/bin/python"
+else
+  PY="$(which python3)"
+fi
+
+if [[ "$(uname)" == "Darwin" ]]; then
+  SK_DYLIBS="$("$PY" -c 'import os, sklearn; print(os.path.join(os.path.dirname(sklearn.__file__), ".dylibs"))' 2>/dev/null || true)"
+  if [[ -n "$SK_DYLIBS" && -d "$SK_DYLIBS" ]]; then
+    export DYLD_LIBRARY_PATH="$SK_DYLIBS${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+  fi
+fi
+
+export PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" "$@"

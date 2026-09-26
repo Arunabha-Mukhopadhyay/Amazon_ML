@@ -1,0 +1,12 @@
+# Pinned, permissively licensed dependencies (MIT / Apache-2.0 / BSD / ISC)
+# Compatible with Python 3.10+ (macOS arm64 and Ubuntu 22.04/24.04 x86_64)
+numpy==2.1.3          # BSD-3
+pandas==2.2.3         # BSD-3
+pyarrow==19.0.1       # Apache-2.0
+scipy==1.15.2         # BSD-3
+scikit-learn==1.6.1   # BSD-3
+lightgbm==4.6.0       # MIT
+rapidfuzz==3.12.2     # MIT
+anyascii==0.3.2       # ISC
+sparse_dot_topn==1.2.0  # Apache-2.0
+tqdm>=4.66.0          # MIT

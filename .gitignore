@@ -1,0 +1,67 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Datasets and Large Data Files (Do not commit to git)
+dataset/
+data_splits/
+*.tsv
+*.csv
+*.parquet
+*.feather
+*.h5
+
+# Output files
+output/
+*.zip
+*.tar.gz
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE & Editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary scratch, work and experiment logs
+scratch/
+experiments/
+work/
+logs/
+*.log
+*.npy
+
+# Temporary comparison folder
+Friends_project_Amazon/
