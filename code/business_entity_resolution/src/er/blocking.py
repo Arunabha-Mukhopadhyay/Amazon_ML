@@ -25,8 +25,11 @@ import argparse
 import os
 import time
 
+
 import numpy as np
 import pandas as pd
+from scipy import sparse
+
 try:
     from sparse_dot_topn import sp_matmul_topn
 except ImportError:
