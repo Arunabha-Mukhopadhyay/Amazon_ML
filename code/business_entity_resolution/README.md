@@ -5,16 +5,21 @@ Matches every Source-1 business entity to its corresponding records across Sourc
 ## Pipeline Architecture
 1. **Multi-Lingual Normalisation & Transliteration**:
    - Phonetic Brahmic transliteration across all 9 Indian scripts with Hindi schwa deletion (`भारत` $\to$ `bharat`).
-   - Normalises US, Indian, and French legal forms, street types, domains, handles, and address anchors.
-2. **High-Recall Sparse Inverted Blocking**:
-   - IDF-weighted token bags (`n:<word>`, `s:<skeleton>`, `ns:<nospace>`, `a:<word>`, `b:<w1>_<w2>`).
-   - Fast C++ top-K cosine similarity retrieval via `sparse_dot_topn.sp_matmul_topn`.
-3. **Pairwise Feature Engineering**:
-   - 40 vectorized features computed via multi-threaded `rapidfuzz` and sparse overlap matrices.
-   - Distinctive house number conflict penalties and candidate shortlist gap features.
-4. **LightGBM Matching & One-to-One Decision**:
-   - LightGBM gradient boosted decision trees.
-   - **`best_per_query` constraint**: assigns each Source 2/3 query to at most one Source 1 entity, heavily boosting precision for the macro $F_{0.5}$ metric.
+   - OCR digit correction (`israe1` $\to$ `israel`, `6lobal` $\to$ `global`), legal forms (`pra li` $\to$ `pvt ltd`), French street expansion (`r` $\to$ `rue`), and component-safe state normalization.
+2. **3-Pass Multi-Resolution Inverted Blocking**:
+   - Three concurrent IDF-weighted cosine searches per country: Combined ($K=10$), Name-only ($K=5$), and Address-only ($K=5$).
+   - Rich n-gram representations: single tokens, consecutive word pairs (`nb:w1_w2`), phonetic skeleton pairs (`sb:k1_k2`), and skip-1 address pairs (`c:w1_w3`).
+   - Retrieves candidates even when company names are rebranded (via address pass) or addresses are minimal/empty (via name pass).
+   - Fast sparse retrieval via `sparse_dot_topn` with automatic `scipy.sparse` fallback.
+3. **91 Vectorized Pair Features**:
+   - **Vectorized Token Alignment (`TokenAligner`)**: Fuzzy word-by-word alignment tracking unmatched words, maximum unmatched token IDF (catches domain-substituted decoys like *"Gold Lotus Healthcare"* vs *"Gold Lotus Technology"*), and token coverage fractions.
+   - **House Number Granular Closeness**: Levenshtein edit distance, prefix match (`house_prefix`), log absolute difference, and typo-tolerant near numbers.
+   - **Shortlist Margins (`mg_*`)**: Competitor score gaps against the query's runner-up candidate across name, address, and cosine blocking scores.
+4. **Two-Stage LightGBM Classifier & Context Re-Scorer**:
+   - **Stage 1**: LightGBM model (`num_leaves=255`, `learning_rate=0.1`, `max_bin=127`) trained on pairwise features.
+   - **Stage 2**: Contextual re-scorer evaluating query competition, candidate competition, and **sibling evidence** (similarity to other queries matching the same S1 entity).
+   - **Automatic Validation Safeguard**: Stage 2 is automatically validated and only applied if it strictly improves held-out macro $F_{0.5}$.
+   - **One-to-One Decision Constraint**: Assigns each query to at most one entity $\hat{s}_1 = \arg\max P(q, s_1) \ge \tau$, maximizing precision for macro $F_{0.5}$.
 
 ---
 
@@ -23,24 +28,29 @@ Matches every Source-1 business entity to its corresponding records across Sourc
 code/business_entity_resolution/
 ├── src/
 │   ├── er/                 # Production C++ & Sparse ML Engine
-│   │   ├── blocking.py     # Candidate generation (sp_matmul_topn)
-│   │   ├── features.py     # 40 vectorized pair features
-│   │   ├── model.py        # LightGBM classifier & best_per_query decision
+│   │   ├── blocking.py     # 3-pass candidate blocking (comb 10, name 5, addr 5)
+│   │   ├── features.py     # 91 features (TokenAligner, house Levenshtein, margins)
+│   │   ├── stage2.py       # Stage 2 sibling & competition re-scorer
+│   │   ├── model.py        # LightGBM classifier & hyperparams
 │   │   ├── indic.py        # 9-script Brahmic phonetic transliterator
-│   │   ├── normalize.py    # Name/address normaliser
+│   │   ├── normalize.py    # Name/address normaliser with OCR/Indic fixes
 │   │   ├── evaluate.py     # Macro F_0.5 evaluator
 │   │   ├── prepare.py      # Parquet caching engine
-│   │   ├── sample.py       # Development sampling
+│   │   ├── sample.py       # Deterministic dev sampling
 │   │   ├── io.py           # Clean TSV parsing & writing
-│   │   └── run.py          # train & predict CLI entrypoints
+│   │   └── run.py          # train, predict, & threshold CLI entrypoints
 │   ├── normalize.py        # Standalone normaliser
 │   ├── metric.py           # Competition F_0.5 metric implementation
 │   ├── split.py            # Canonical 80/20 train/val splitter
 │   ├── baseline.py         # Exact match baseline
 │   ├── blocking.py         # Multi-key inverted index blocking
-│   ├── features.py         # 14 similarity/conflict features
-│   ├── matching.py         # Hybrid LightGBM / SGD matcher
-│   └── pipeline.py         # Fast local & cloud orchestrator
+│   ├── features.py         # Similarity/conflict features
+│   ├── matching.py         # Matcher interface
+│   └── pipeline.py         # Fast local orchestrator
+├── tools/                  # Analysis & calibration scripts
+│   ├── threshold_decoy_weight.py # Decoy-weighted threshold optimizer for test set
+│   ├── analyze_errors.py   # Detailed validation error budget breakdown
+│   └── inspect_test_country.py # French test distribution inspector
 ├── scripts/
 │   ├── py                  # Python runner with OpenMP resolution
 │   ├── setup_vm.sh         # Automated Ubuntu VM setup & idle auto-shutdown
@@ -66,7 +76,7 @@ bash code/business_entity_resolution/scripts/run_full.sh
 ```
 *Generates `output/matching_results.tsv` and `output/candidate_pairs.tsv` and validates against `utils/validate_submission.py`.*
 
-### 3. Fast Local Validation Mode (Zero-C++ Dependency on Local Mac)
+### 3. Fast Local Validation Mode (Zero External Dependency)
 ```bash
 PYTHONPATH=code/business_entity_resolution python3 code/business_entity_resolution/src/pipeline.py --mode sample
 ```

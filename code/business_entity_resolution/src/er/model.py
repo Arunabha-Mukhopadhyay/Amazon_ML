@@ -13,10 +13,11 @@ import pandas as pd
 
 PARAMS = {
     "objective": "binary",
-    "learning_rate": 0.05,
-    "num_leaves": 127,
-    "min_data_in_leaf": 200,
-    "feature_fraction": 0.8,
+    "learning_rate": 0.1,
+    "num_leaves": 255,
+    "min_data_in_leaf": 500,
+    "max_bin": 127,
+    "feature_fraction": 0.7,
     "bagging_fraction": 0.8,
     "bagging_freq": 1,
     "lambda_l2": 1.0,
@@ -28,12 +29,15 @@ PARAMS = {
 }
 
 
-def train_model(x_tr, y_tr, x_es, y_es, max_rounds=3000, early_stop=100):
+PARAMS_STAGE2 = dict(PARAMS, learning_rate=0.05, num_leaves=127, min_data_in_leaf=200)
+
+
+def train_model(x_tr, y_tr, x_es, y_es, max_rounds=1500, early_stop=50, params=None):
     """Train with early stopping on a held-out (early-stopping) fold."""
     dtr = lgb.Dataset(x_tr, label=y_tr, free_raw_data=True)
     des = lgb.Dataset(x_es, label=y_es, reference=dtr, free_raw_data=True)
     return lgb.train(
-        PARAMS, dtr, num_boost_round=max_rounds, valid_sets=[des], valid_names=["es"],
+        params or PARAMS, dtr, num_boost_round=max_rounds, valid_sets=[des], valid_names=["es"],
         callbacks=[lgb.early_stopping(early_stop, verbose=False), lgb.log_evaluation(100)],
     )
 

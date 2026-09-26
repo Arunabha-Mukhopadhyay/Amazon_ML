@@ -87,7 +87,10 @@ def skeleton(token):
     s = token
     for a, b in _SKEL_PAIRS:
         s = s.replace(a, b)
-    s = s[0] + _VOWELS_RE.sub("", s[1:])
+    # a leading vowel is kept only as a neutral marker ("indian"/"indiyan" -> "andn",
+    # "agro"/"egro" -> "agr"), since transliteration often changes it
+    head = "a" if s[0] in "aeiouy" else s[0]
+    s = head + _VOWELS_RE.sub("", s[1:])
     return _REPEAT_RE.sub(r"\1", s)
 
 
@@ -134,15 +137,38 @@ _HANDLE_RE = re.compile(r"@([a-z0-9_]+)")
 _MS_PREFIX_RE = re.compile(r"^\s*m\s*/\s*s\b\.?")
 
 
+_DIGIT_AS_LETTER = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "6": "g", "7": "t", "8": "b"})
+
+
+def _fix_digits(token):
+    """Undo OCR-style digit-for-letter typos inside words: 'israe1'->'israel',
+    '6lobal'->'global', 'a1l'->'all'. Tokens that are mostly digits
+    ('24x7', '3m', 'b2b') are left alone."""
+    if token.isalpha() or token.isdigit():
+        return token
+    letters = sum(c.isalpha() for c in token)
+    if letters >= 2 and letters >= len(token) - 2:
+        fixed = token.translate(_DIGIT_AS_LETTER)
+        if fixed.isalpha():
+            return fixed
+    return token
+
+
 def _name_core(tokens):
     """Split tokens into (core tokens, canonical legal forms)."""
     core, legal = [], []
+    prev = ""
     for t in tokens:
-        t = NAME_ABBREV.get(t, t)
+        t = NAME_ABBREV.get(_fix_digits(t), _fix_digits(t))
         if t in LEGAL_FORMS:
             legal.append(LEGAL_FORMS[t])
+        elif t == "li" and prev in ("pra", "pvt"):  # "प्रा. लि." = Pvt. Ltd.
+            legal.append("ltd")
+        elif t == "pra":
+            legal.append("pvt")
         elif t not in NAME_STOPWORDS:
             core.append(t)
+        prev = t
     return _dedupe_consecutive(core), legal
 
 
@@ -224,9 +250,10 @@ ADDR_CANON = {
     "north": "n", "south": "s", "east": "e", "west": "w", "northeast": "ne", "northwest": "nw",
     "southeast": "se", "southwest": "sw",
     # French
-    "chemin": "chem", "che": "chem", "impasse": "imp", "allee": "all", "faubourg": "fbg",
-    "residence": "res", "batiment": "bldg", "bat": "bldg", "etage": "fl",
+    "r": "rue", "chemin": "chem", "che": "chem", "impasse": "imp", "allee": "all",
+    "faubourg": "fbg", "residence": "res", "batiment": "bldg", "bat": "bldg", "etage": "fl",
 }
+_DIGITS_RE = re.compile(r"\d+")
 ORDINAL_WORDS = {
     "first": "1", "second": "2", "third": "3", "fourth": "4", "fifth": "5", "sixth": "6",
     "seventh": "7", "eighth": "8", "ninth": "9", "tenth": "10", "eleventh": "11",
@@ -275,44 +302,48 @@ INDIA_STATES = {
 INDIA_CODE_ALIASES = {"ori": "od", "or": "od", "tg": "ts", "ct": "cg", "uk": "uk", "ut": "uk"}
 
 
-def _phrase_regex(names):
-    alt = "|".join(sorted((re.escape(n) for n in names), key=len, reverse=True))
-    return re.compile(r"\b(?:" + alt + r")\b")
-
-
 _STATE_TABLES = {
-    "us": (US_STATES, _phrase_regex(US_STATES), set(US_STATES.values()), {}),
-    "india": (INDIA_STATES, _phrase_regex(INDIA_STATES), set(INDIA_STATES.values()), INDIA_CODE_ALIASES),
+    "us": (US_STATES, set(US_STATES.values()), {}),
+    "india": (INDIA_STATES, set(INDIA_STATES.values()), INDIA_CODE_ALIASES),
 }
 _INDIA_STATE_NAMES = list(INDIA_STATES)
 
 _PMB_RE = re.compile(r"\b(?:pmb|p\s*o\s*box|po\s*box|post\s*box)\s*#?\s*[a-z0-9-]+")
 _ORDINAL_NUM_RE = re.compile(r"\b(\d+)(?:st|nd|rd|th)\b")
+_ALNUM_SPLIT_RE = re.compile(r"^(\d+)([a-z]{1,2})$")  # "15921a" -> "15921" "a"; "5f" -> "5" "f"
 
 
 def _canon_component(comp, country, from_indic):
-    """Normalise one comma-separated address component; returns tokens."""
+    """Normalise one comma-separated address component; returns tokens.
+
+    A state name is replaced by its code only when it forms the whole
+    component (optionally with a postcode), so "Washington Street" stays a
+    street while ", Washington," becomes "wa".
+    """
+    toks = _tokens(comp)
     table = _STATE_TABLES.get(country)
-    if table is not None:
-        names, regex, codes, aliases = table
-        comp = regex.sub(lambda m: " " + names[m.group(0)] + " ", comp)
-        stripped = comp.strip()
-        if stripped in aliases and len(stripped) <= 3:
-            comp = aliases[stripped]
-        elif country == "india" and from_indic and stripped and stripped not in codes:
+    if table is not None and toks:
+        names, codes, aliases = table
+        key = " ".join(t for t in toks if not t.isdigit())
+        code = names.get(key) or (aliases.get(key) if " " not in key else None)
+        if code is None and country == "india" and from_indic and key and key not in codes:
             # transliterated state names are close but not exact ("karnatak")
-            hit = process.extractOne(stripped, _INDIA_STATE_NAMES, scorer=fuzz.ratio, score_cutoff=85)
+            hit = process.extractOne(key, _INDIA_STATE_NAMES, scorer=fuzz.ratio, score_cutoff=85)
             if hit:
-                comp = INDIA_STATES[hit[0]]
+                code = INDIA_STATES[hit[0]]
+        if code is not None:
+            toks = [code] + [t for t in toks if t.isdigit()]
     out = []
-    for t in _tokens(comp):
-        t = ORDINAL_WORDS.get(t, t)
-        if t.isdigit():
-            t = t.lstrip("0") or "0"
-        else:
-            t = ADDR_CANON.get(t, t)
-        if t not in ADDR_STOPWORDS:
-            out.append(t)
+    for tok in toks:
+        m = _ALNUM_SPLIT_RE.match(tok)
+        for t in (m.groups() if m else (tok,)):
+            t = ORDINAL_WORDS.get(t, t)
+            if t.isdigit():
+                t = t.lstrip("0") or "0"
+            else:
+                t = ADDR_CANON.get(t, t)
+            if t not in ADDR_STOPWORDS:
+                out.append(t)
     return out
 
 
@@ -335,7 +366,7 @@ def normalize_address(raw, country):
             comps.append(" ".join(ct))
             tokens.extend(ct)
     tokens = _dedupe_consecutive(tokens)
-    nums = [t for t in tokens if t.isdigit()]
+    nums = [d.lstrip("0") or "0" for t in tokens for d in _DIGITS_RE.findall(t)]
     return {
         "tokens": tokens,
         "full": " ".join(tokens),
